@@ -1,0 +1,6 @@
+*.npy
+.flake8
+.ipynb_checkpoints/
+__pycache__/
+llm_weights/
+Llama-2-7b-chat-hf/
