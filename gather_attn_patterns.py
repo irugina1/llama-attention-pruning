@@ -13,6 +13,7 @@ DEVICE = "mps" if LOCAL else "cuda"
 MODEL_PATH = "Llama-2-7b-chat-hf"
 MAX_LENGTH = 4096  # context length for llama2
 STRIDE = 4096
+CHECKPOINT_IDX = 8
 
 # modal setup
 stub = Stub()
@@ -74,6 +75,13 @@ def checkpoint(average, counts, checkpoint_descriptor):
         volume.commit()
 
 
+def load_checkpoint(checkpoint_descriptor):
+    save_dir = "." if LOCAL else "/my_vol"
+    average = np.load(f"{save_dir}/average_attention_{checkpoint_descriptor}.npy")
+    counts = np.load(f"{save_dir}/counts_{checkpoint_descriptor}.npy")
+    return average, counts.item()
+
+
 @stub.function(
     volumes={"/my_vol": volume}, image=image, gpu=GPU_CONFIG, timeout=60 * 60 * 24
 )
@@ -110,7 +118,12 @@ def main():
     )
     N = 0
     chunk_idx = 0
+    if CHECKPOINT_IDX:
+        average, N = load_checkpoint(CHECKPOINT_IDX)
     for start_idx, end_idx in zip(boundaries[:-1], boundaries[1:]):
+        if CHECKPOINT_IDX and CHECKPOINT_IDX > chunk_idx:
+            chunk_idx += 1
+            continue
         print(f"starting chunk {chunk_idx + 1} out of {NUM_CHUNKS}")
         encodings = tokenizer(
             " ".join(train["text"][start_idx:end_idx]), return_tensors="pt"
