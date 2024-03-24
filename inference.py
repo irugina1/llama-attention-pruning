@@ -6,17 +6,30 @@ import numpy as np
 from datasets import load_dataset
 import modal
 from modal import Stub, Image, gpu
-import gc
 from typing import Optional, Tuple
-from deepspeed.ops.sparse_attention import SparseSelfAttention, DenseSparsityConfig
+from deepspeed.ops.sparse_attention import SparseSelfAttention, SparsityConfig, DenseSparsityConfig
+import subprocess as sp
+import gc
+import time
 
 # constants
 DEVICE = "cuda"
 MODEL_PATH = "Llama-2-7b-chat-hf"
 MAX_LENGTH = 4096  # context length for llama2
 STRIDE = 4096
-BATCH_SIZE = 4
-USE_SPARSE_ATTENTION = False
+BATCH_SIZE = 2
+USE_SPARSE_ATTENTION = True
+LAYOUT_PATH = "layout_average_attention_18_percentile_60.pt"
+
+
+def get_gpu_memory():  # in GB
+    command = "nvidia-smi --query-gpu=memory.free --format=csv"
+    memory_free_info = (
+        sp.check_output(command.split()).decode("ascii").split("\n")[:-1][1:]
+    )
+    memory_free_values = [int(x.split()[0]) for i, x in enumerate(memory_free_info)]
+    return memory_free_values[0] / 1024
+
 
 # modal setup
 stub = Stub()
@@ -35,7 +48,6 @@ image = (
         "cd triton && "
         "git checkout 44442db96ef6dc55d27dc047ce240d0b1397e5ef && "
         "cd python && "
-        # "pip install cmake && cmake --version && "
         "pip install -e ."
     )
 )
@@ -43,12 +55,36 @@ GPU_CONFIG = gpu.A100(memory=80, count=1)
 volume = modal.Volume.from_name("llama-2-7b-chat-hf")
 
 
+class APSparsityConfig(SparsityConfig):
+    def __init__(self, num_heads, layout, block=16, different_layout_per_head=True):
+        super().__init__(num_heads, block, different_layout_per_head)
+        self.layout = layout
+
+    def make_layout(self, seq_len):
+        """Set 1 to all blocks of the layout meaning the pattern is dense; not sparse.
+
+        Arguments:
+             seq_len: required: an integer determining the underling sequence length;
+             must be <= max sequence length
+
+        Return:
+             layout: a tensor of dimension (num_heads, num_blocks, num_blocks)
+             containing sparsity layout of all head; for dense everything is 1
+        """
+        # return self.layout.contiguous().clone()
+        return self.layout
+
+
 def running_average(old_average, sum_new_values, N, M):
     return old_average * N / (N + M) + (sum_new_values) / (N + M)
 
 
 def update_nll_running_average(model, input_ids, target_ids, average, N):
-    outputs = model(input_ids, labels=target_ids)
+    try:
+        outputs = model(input_ids, labels=target_ids)
+    except Exception as e:  # noqa
+        print(str(e))
+        return average, N
     neg_log_likelihood = outputs.loss
     bsz = input_ids.shape[0]
     average = running_average(average, neg_log_likelihood.item() * bsz, N, bsz)
@@ -108,7 +144,7 @@ class LlamaRotaryEmbedding(torch.nn.Module):
 def rotate_half(x):
     """Rotates half the hidden dims of the input."""
     x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
+    x2 = x[..., x.shape[-1] // 2:]
     return torch.cat((-x2, x1), dim=-1)
 
 
@@ -156,7 +192,7 @@ class LlamaSparseAttention(nn.Module):
         )
 
         self.sparse_self_attention = SparseSelfAttention(
-            sparsity_config, max_seq_length=4096, attn_mask_mode='add'
+            sparsity_config, max_seq_length=4096, attn_mask_mode="add"
         )
 
     def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
@@ -223,8 +259,10 @@ class LlamaSparseAttention(nn.Module):
         return attn_output, attn_weights, past_key_value
 
 
-def replace_self_attention_layers(config, layers, sparsity_config):
-    for layer in layers:
+def replace_self_attention_layers(config, layers, layout):
+    for idx, layer in enumerate(layers):
+        # sparsity_config = APSparsityConfig(num_heads=32, layout=layout[idx])
+        sparsity_config = DenseSparsityConfig(num_heads=32)
         deepspeed_sparse_self_attn = LlamaSparseAttention(config, sparsity_config).to(
             DEVICE
         )
@@ -243,6 +281,7 @@ def replace_self_attention_layers(config, layers, sparsity_config):
     volumes={"/my_vol": volume}, image=image, gpu=GPU_CONFIG, timeout=60 * 60 * 24
 )
 def main():
+    print("free memory, initially = ", get_gpu_memory())
     model_path = f"/my_vol/{MODEL_PATH}/"
     model = (
         AutoModelForCausalLM.from_pretrained(model_path, cache_dir="llm_weights")
@@ -253,21 +292,43 @@ def main():
         "NousResearch/Llama-2-7b-chat-hf", cache_dir="llm_weights", use_fast=True
     )
 
-    test = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
+    layout = torch.load(f"/my_vol/{LAYOUT_PATH}")
+    layout = layout.to(torch.int64)
+
+    test = load_dataset(
+        "wikitext", "wikitext-2-raw-v1", split="test", cache_dir="/my-vol"
+    )
+    volume.commit()
+
     encodings = tokenizer("\n\n".join(test["text"]), return_tensors="pt")
     seq_len = encodings.input_ids.size(1)
 
     config = model.config
-    sparsity_config = DenseSparsityConfig(num_heads=32)
     if USE_SPARSE_ATTENTION:
         print("Using deepspeed sparse attention")
-        replace_self_attention_layers(config, model.model.layers, sparsity_config)
+        replace_self_attention_layers(config, model.model.layers, layout)
+
+    print("free memory, after loading the model = ", get_gpu_memory())
 
     prev_end_loc = 0
     average = 0
     N = 0
     batch_counter = 0
-    num_batches = math.ceil(seq_len/(STRIDE * BATCH_SIZE))
+    num_batches = math.ceil(seq_len / (STRIDE * BATCH_SIZE))
+    for begin_loc in range(0, seq_len, STRIDE):
+        end_loc = min(begin_loc + MAX_LENGTH, seq_len)
+        if end_loc == seq_len:
+            break
+
+        input_ids = encodings.input_ids[:, begin_loc:end_loc].to(DEVICE)
+        with torch.inference_mode():
+            model(input_ids)
+            print("free memory, after fwd pass = ", get_gpu_memory())
+            break
+            gc.collect()
+            torch.cuda.empty_cache()
+            gc.collect()
+    times = []
     for outer_begin_loc in range(0, seq_len, STRIDE * BATCH_SIZE):
         batch_counter += 1
         print(f"starting work on batch {batch_counter} out of {num_batches}")
@@ -294,18 +355,24 @@ def main():
                 target_ids = batch_target_ids[sequence_idx]
                 with torch.inference_mode():
                     average, N = update_nll_running_average(
-                        model, input_ids, target_ids, average, N)
+                        model, input_ids, target_ids, average, N
+                    )
 
         else:
+            t1 = time.time()
             input_ids = torch.squeeze(torch.stack(batch_input_ids), 1)
             target_ids = torch.squeeze(torch.stack(batch_target_ids), 1)
 
             with torch.inference_mode():
                 average, N = update_nll_running_average(
-                    model, input_ids, target_ids, average, N)
+                    model, input_ids, target_ids, average, N
+                )
+            t2 = time.time()
+            times.append(t2 - t1)
         print(average)
     ppl = np.exp(average)
     print(f"estimated perplexity = {ppl}")
+    print(f"elapsed time mean and std = {np.mean(times), np.std(times)}")
 
 
 if __name__ == "__main__":
