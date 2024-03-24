@@ -15,7 +15,7 @@ def get_sparsity_config(attention, percentile, block_size):
             comparison.shape[3] // block_size,
             block_size,
         )
-        .all(axis=(-1, -3))
+        .any(axis=(-1, -3))
     )
     return sparsity
 
